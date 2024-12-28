@@ -1,0 +1,29 @@
+id: python-embedded-example
+namespace: company.team
+
+tasks:
+  - id: before_commands
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    script: |
+      import requests
+      import kestra
+      import numpy as np
+      import pandas as pd
+
+      kestra_modules = [i for i in dir(kestra.Kestra) if not i.startswith("_")]
+
+      print(f"Requests version: {requests.__version__}")
+      print(f"Kestra modules: {kestra_modules}")
+
+      data = {
+        "ColumnA": np.random.randint(0, 100, size=10),
+        "ColumnB": np.random.rand(10),
+      }
+      
+      # Create a DataFrame
+      df = pd.DataFrame(data)
+      
+      # Print the first 5 rows
+      print(df.head())

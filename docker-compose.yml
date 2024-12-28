@@ -1,0 +1,6 @@
+services:
+  kestra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kestra-python:latest
