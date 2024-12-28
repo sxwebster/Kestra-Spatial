@@ -1,0 +1,55 @@
+id: multi_node_task
+namespace: company.team
+
+tasks:
+  - id: load_csv_from_url
+    type: io.kestra.plugin.scripts.python.Script
+    description: Downloads a csv file and cleans the 'Age' column
+    outputFiles:
+      - "temp.csv"
+    script: |-
+      import pandas as pd
+      from kestra import Kestra
+
+      logger = Kestra.logger()
+      logger.debug("Downloading messy dataset from Hugging Face")
+
+      # Correctly read CSV into a DataFrame
+      df = pd.read_csv("https://huggingface.co/datasets/kestra/datasets/raw/main/csv/messy_dataset.csv")
+
+      logger.debug("Replacing missing ages with median")
+
+      # Convert Age to numeric and fill NaN with mean
+      df["Age"] = pd.to_numeric(df["Age"], errors="coerce")
+      mean_age = int(df["Age"].mean())
+      df["Age"] = df["Age"].fillna(mean_age)
+
+      # Save the cleaned DataFrame
+      df.to_csv("temp.csv", index=False)
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
+  - id: test_python_modules
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Shows the version of the Python requests module, prints available Kestra modules, 
+      and constructs a random dataframe using pandas. Uses the local Python environment.
+    inputFiles:
+      in.csv: "{{ outputs.load_csv_from_url.outputFiles['temp.csv'] }}"
+    script: |-
+      import requests
+      import pandas as pd
+      from kestra import Kestra
+
+      logger = Kestra.logger()
+      logger.info("Loading CSV from the first task's output file")
+
+      # Here we read directly from 'outputFile'
+      df = pd.read_csv("{{ workingDir }}/in.csv")
+      logger.info(f"Loaded {len(df)} rows")
+
+      print(f"Requests version: {requests.__version__}")
+      print(df.head())
+      
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
