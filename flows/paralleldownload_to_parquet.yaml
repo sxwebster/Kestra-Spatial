@@ -1,0 +1,70 @@
+id: daily_firms_csv_update
+namespace: workflows
+
+tasks:
+  - id: csv_data_download
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      # Download tasks for each dataset
+      - id: dl_modis_c6
+        type: io.kestra.plugin.core.http.Download
+        uri: https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Australia_NewZealand_24h.csv
+        description: Download MODIS C6.1 dataset
+
+      - id: dl_suomi_viirs_c2
+        type: io.kestra.plugin.core.http.Download
+        uri: https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Australia_NewZealand_24h.csv
+        description: Download SUOMI VIIRS C2 dataset
+
+      - id: dl_j1_viirs_c2
+        type: io.kestra.plugin.core.http.Download
+        uri: https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Australia_NewZealand_24h.csv
+        description: Download J1 VIIRS C2 dataset
+
+      - id: dl_j2_viirs_c2
+        type: io.kestra.plugin.core.http.Download
+        uri: https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-21-viirs-c2/csv/J2_VIIRS_C2_Australia_NewZealand_24h.csv
+        description: Download J2 VIIRS C2 dataset
+
+  #
+  # 1) Convert CSVs to Parquet & store the paths in parquet_paths.json
+  #
+  - id: convert_csvs_to_parquet
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: Convert all CSVs to Parquet
+    outputFiles:
+      - "*.json"
+      - "*.parquet"
+    script: |
+      import pandas as pd
+      import geopandas as gpd
+      import json
+
+      # Hypothetical inputs from previous tasks or from your Flow's inputs
+      datasets = {
+          "MODIS_C6_1": "{{ outputs.dl_modis_c6.uri }}",
+          "SUOMI_VIIRS_C2": "{{ outputs.dl_suomi_viirs_c2.uri }}",
+          "J1_VIIRS_C2": "{{ outputs.dl_j1_viirs_c2.uri }}",
+          "J2_VIIRS_C2": "{{ outputs.dl_j2_viirs_c2.uri }}"
+      }
+
+      parquet_paths = {}
+
+      for name, file_path in datasets.items():
+          df = pd.read_csv(file_path)
+          # Create geometry from longitude, latitude
+          gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.longitude, df.latitude))
+
+          # Convert to Parquet
+          parquet_path = f"{name}.parquet"
+          gdf.to_parquet(parquet_path, engine="pyarrow")
+          parquet_paths[name] = parquet_path
+
+      # Write out parquet_paths so we can read it in the next task
+      with open("parquet_paths.json", "w") as f:
+          json.dump(parquet_paths, f)
+
+    
+    
