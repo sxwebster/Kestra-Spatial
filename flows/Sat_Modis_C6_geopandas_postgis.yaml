@@ -4,6 +4,11 @@ namespace: workflows
 variables:
   satellite: modis_c6
 
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "30 4 * * *" # Run every day at 4:30 AM
+
 tasks:
   - id: csv_data_download
     type: io.kestra.plugin.core.flow.Parallel
@@ -85,6 +90,17 @@ tasks:
       logger.debug(f"Loading dataset from: {dataset}")
 
       df = pd.read_csv(dataset)
+      # rename column bright_t31 to secondary_brightness_channel
+      df.rename(columns={"bright_t31": "secondary_brightness"}, inplace=True)
+      # add column "secondary_brightness_channel" and set the value to "T31"
+      df["secondary_brightness_channel"] = "T31"
+      
+      # add column original_brightness_channel and set the value to 21
+      df["original_brightness_channel"] = "21"
+      # add a column "confidence_text" and set the value to "n/a"
+      df["confidence_txt"] = "n/a"
+
+
 
       # Example: ensure column names match your CSV (like "latitude", "longitude", "acq_date", etc.)
       # If your columns differ, rename them accordingly, e.g.: df.rename(columns={...}, inplace=True)
