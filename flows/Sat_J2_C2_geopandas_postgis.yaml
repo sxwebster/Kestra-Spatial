@@ -1,0 +1,219 @@
+id: daily_j2_c2_csv_update
+namespace: workflows
+
+variables:
+  satellite: j2_c2
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "36 4 * * *"
+
+tasks:
+  - id: csv_data_download
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      # Download tasks for each dataset
+      - id: dl_sat_csv
+        type: io.kestra.plugin.core.http.Download
+        uri: https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-21-viirs-c2/csv/J2_VIIRS_C2_Australia_NewZealand_24h.csv
+        description: Download VIIRS j2 C2 dataset
+
+  - id: convert_csv_to_parquet
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: Convert all CSVs to Parquet
+    outputFiles:
+      - "{{vars.satellite}}.parquet"
+    script: |
+      import pandas as pd
+      import geopandas as gpd
+      import json
+      import time
+      from kestra import Kestra
+
+      logger=Kestra.logger()
+
+      # Hypothetical inputs from previous tasks or from your Flow's inputs
+      dataset = "{{ outputs.dl_sat_csv.uri }}"
+
+      df = pd.read_csv(dataset)
+      # Create geometry from longitude, latitude
+      gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.longitude, df.latitude))
+      gdf.to_parquet("{{vars.satellite}}.parquet", engine="pyarrow")
+
+  - id: upsert-parquet
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: |
+      1. Load the CSV (or Parquet) file.
+      2. Convert to a GeoDataFrame.
+      3. Ensure final table with the same schema & create geometry column.
+      4. Create a unique index on (latitude, longitude, acq_date, acq_time, satellite).
+      5. Bulk insert into temp table.
+      6. Upsert into final table using ON CONFLICT on those columns.
+
+    script: |
+      import geopandas as gpd
+      import pandas as pd
+      import os
+      from sqlalchemy import create_engine, MetaData
+      from geoalchemy2 import Geometry
+      from kestra import Kestra
+
+      logger = Kestra.logger()
+      logger.debug("Starting upsert script...")
+
+      # ------------------------------------------------------------------------------
+      # 1. SET UP CONNECTION & TABLE NAMES
+      # ------------------------------------------------------------------------------
+      engine = create_engine("postgresql://docker_user:docker_user@localhost:5432/docker_user")
+
+      final_table_name = "hotspot_points"    # final PostGIS table
+      temp_table_name  = "hotspot_points_tmp" # staging table
+
+      metadata = MetaData()
+      metadata.reflect(bind=engine)
+
+      # ------------------------------------------------------------------------------
+      # 2. LOAD YOUR CSV OR PARQUET FILE
+      #
+      #    In your original script, you used:
+      #      dataset = "{{ outputs.dl_sat_csv.uri }}"
+      #
+      #    Here we assume you are still reading CSV for simplicity.
+      #    (If you're actually reading a Parquet from the previous step, replace with pd.read_parquet.)
+      # ------------------------------------------------------------------------------
+      dataset = "{{ outputs.dl_sat_csv.uri }}"
+      logger.debug(f"Loading dataset from: {dataset}")
+
+      df = pd.read_csv(dataset)
+      # rename column bright_ti4 to brightness
+      df.rename(columns={"bright_ti4": "brightness"}, inplace=True)
+      # rename column bright_ti5 to secondary_brightness_channel
+      df.rename(columns={"bright_ti5": "secondary_brightness"}, inplace=True)
+      # add column "secondary_brightness_channel" and set the value to "ti5"
+      df["secondary_brightness_channel"] = "ti5"
+
+      # add column original_brightness_channel and set the value to 21
+      df["original_brightness_channel"] = "ti4"
+      # rename column confidence to confidence_text and leave empty
+      df.rename(columns={"confidence": "confidence_txt"}, inplace=True)
+      # add column confidence and set the value to -9999
+      df["confidence"] = -9999
+
+      # Example: ensure column names match your CSV (like "latitude", "longitude", "acq_date", etc.)
+      # If your columns differ, rename them accordingly, e.g.: df.rename(columns={...}, inplace=True)
+
+      # ------------------------------------------------------------------------------
+      # 3. CREATE GEOMETRY & CONVERT TO GeoDataFrame
+      # ------------------------------------------------------------------------------
+      gdf = gpd.GeoDataFrame(
+          df,
+          geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+          crs="EPSG:4326"
+      )
+
+      # ------------------------------------------------------------------------------
+      # 4. CREATE (OR UPDATE) THE FINAL TABLE IF IT DOES NOT EXIST
+      #    We "replace" it only if the table does not exist. If you'd rather keep
+      #    data, switch to 'append' or handle it differently.
+      # ------------------------------------------------------------------------------
+      if final_table_name not in metadata.tables:
+          # Create an empty table by writing a small subset of rows or the entire GDF
+          # so that the schema matches.
+          sample_gdf = gdf.head(10)  # just use first 10 rows for schema
+          sample_gdf.to_postgis(
+              name=final_table_name,
+              con=engine,
+              if_exists="replace",    # or "append", "fail", etc. as needed
+              index=False,
+              dtype={"geometry": Geometry("POINT", srid=4326)},
+          )
+          logger.info(f"Created new table '{final_table_name}'.")
+
+          # Refresh metadata so metadata.tables has the newly created table
+          metadata.reflect(bind=engine)
+
+      # ------------------------------------------------------------------------------
+      # 5. CREATE A UNIQUE INDEX (IF NOT EXISTS) ON (latitude, longitude, acq_date, acq_time, satellite)
+      #    This step is critical for ON CONFLICT to work with multiple columns.
+      # ------------------------------------------------------------------------------
+      create_index_sql = f"""
+      CREATE UNIQUE INDEX IF NOT EXISTS {final_table_name}_ux
+      ON {final_table_name} (latitude, longitude, acq_date, acq_time, satellite);
+      """
+      with engine.begin() as conn:
+          conn.exec_driver_sql(create_index_sql)
+
+      # ------------------------------------------------------------------------------
+      # 6. DROP TEMP TABLE IF IT EXISTS, THEN BULK INSERT INTO TEMP TABLE
+      # ------------------------------------------------------------------------------
+      with engine.begin() as conn:
+          conn.exec_driver_sql(f"DROP TABLE IF EXISTS {temp_table_name}")
+
+      gdf.to_postgis(
+          name=temp_table_name,
+          con=engine,
+          if_exists="replace",
+          index=False,
+          dtype={"geometry": Geometry("POINT", srid=4326)},
+      )
+      logger.info(f"Loaded {len(gdf)} records into temp table '{temp_table_name}'.")
+
+      # ------------------------------------------------------------------------------
+      # 7. UPSERT RECORDS FROM TEMP TABLE -> FINAL TABLE
+      #    We will insert all columns in df plus the geometry. Then use
+      #    ON CONFLICT (latitude, longitude, acq_date, acq_time, satellite) to update.
+      #
+      #    Because ON CONFLICT needs a known set of columns, we'll build the list
+      #    from the actual df.columns. For simplicity, we'll assume your CSV includes
+      #    the columns: [latitude, longitude, acq_date, acq_time, satellite, ...].
+      # ------------------------------------------------------------------------------
+      # Build a list of every column from the DF. Exclude geometry since we add it separately:
+      df_cols = df.columns.tolist()  # all columns from the CSV
+      # The final upsert will also handle 'geometry'.
+
+      # Build the columns portion for the INSERT statement
+      # e.g.  "latitude, longitude, acq_date, acq_time, satellite, conf, brightness, geometry"
+      insert_cols_str = ", ".join(df_cols + ["geometry"])
+
+      # The SELECT portion mirrors the same columns from temp table
+      select_cols_str = ", ".join(df_cols + ["geometry"])
+
+      # For the UPDATE portion, we skip the conflict columns:
+      conflict_cols = ["latitude", "longitude", "acq_date", "acq_time", "satellite"]
+      update_assignments = []
+      for c in df_cols:
+          if c not in conflict_cols:
+              update_assignments.append(f"{c} = EXCLUDED.{c}")
+      # also update geometry
+      update_assignments.append("geometry = EXCLUDED.geometry")
+      update_str = ", ".join(update_assignments)
+
+      # Now build the final upsert SQL
+      upsert_sql = f"""
+      INSERT INTO {final_table_name} ({insert_cols_str})
+      SELECT {select_cols_str}
+      FROM {temp_table_name}
+      ON CONFLICT (latitude, longitude, acq_date, acq_time, satellite)
+      DO UPDATE SET
+          {update_str}
+      """
+
+      logger.debug(f"Upsert SQL:\n{upsert_sql}")
+
+      with engine.begin() as conn:
+          conn.exec_driver_sql(upsert_sql)
+
+      logger.info(f"Upsert complete! Data from '{temp_table_name}' merged into '{final_table_name}'.")
+
+      # ------------------------------------------------------------------------------
+      # 8. CLEAN UP: DROP TEMP TABLE IF DESIRED
+      # ------------------------------------------------------------------------------
+      with engine.begin() as conn:
+          conn.exec_driver_sql(f"DROP TABLE IF EXISTS {temp_table_name}")
+      logger.info(f"Dropped temp table '{temp_table_name}'.")
+      logger.info("All done!")
