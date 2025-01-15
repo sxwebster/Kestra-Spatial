@@ -1,0 +1,269 @@
+id: flood-gauge-levels-qld
+namespace: workflows
+
+triggers:
+  - id: flood-gauge-qld-schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0/6 * * * *"
+
+tasks:
+  - id: collect-flood-gauge-values-qld
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    
+    script: |
+      from scrapling import Fetcher
+      from bs4 import BeautifulSoup
+      import pandas as pd
+      import re
+      from datetime import datetime, timedelta
+      from zoneinfo import ZoneInfo
+      from kestra import Kestra
+
+      logger=Kestra.logger()
+      
+      # The line below is assumed in your script:
+      # from sqlalchemy import create_engine, text
+      from sqlalchemy import create_engine, text
+
+      page = Fetcher().get('http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60005.html', stealthy_headers=True, follow_redirects=True)
+
+      #print the type of the page
+      print(type(page))
+
+      #convert page to string
+      page = str(page)
+
+      def parse_time_day_to_datetime(value, today_aest=None):
+          """
+          Given a string like "11.49pm Tue", return a datetime in AEST for the *current week*.
+          Search backward up to 6 days if the day-of-week doesn't match "today".
+          """
+
+          if not value or pd.isnull(value):
+              return pd.NaT  # or None
+
+          # If "today_aest" wasn't provided, use now in AEST:
+          if today_aest is None:
+              tz = ZoneInfo("Australia/Brisbane")
+              today_aest = datetime.now(tz=tz)
+
+          # 1) Extract the time portion and the day name
+          # Typical format: "HH.MM(am|pm) DayName"
+          # e.g. "11.49pm Tue", "6.29am Wed"
+          match = re.match(r"^(\d{1,2})\.(\d{1,2})(am|pm)\s+(\w+)$", value.strip(), re.IGNORECASE)
+          if not match:
+              # If it doesn't match our expected pattern, return NaT or None
+              return pd.NaT
+
+          hour_str, minute_str, ampm, day_str = match.groups()
+          hour = int(hour_str)
+          minute = int(minute_str)
+          ampm = ampm.lower()  # 'am' or 'pm'
+
+          # Convert to 24-hour format
+          if ampm == 'pm' and hour < 12:
+              hour += 12
+          elif ampm == 'am' and hour == 12:
+              hour = 0
+
+          # 2) Figure out which calendar date in the last 7 days has the correct day name
+          # Define a day-of-week name map, matching strftime("%a") output: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+
+          tz = ZoneInfo("Australia/Brisbane")
+          # Consider 'today' as the day we run the script, in AEST.
+          # Go from 0 to 6 days ago to find a date whose .strftime("%a") = day_str
+          for offset in range(7):
+              candidate = today_aest - timedelta(days=offset)
+              if candidate.strftime("%a") == day_str.title():  # e.g. "Wed" or "Tue"
+                  # Found the matching day
+                  # Now replace hour/minute to form the final reading datetime
+                  reading_dt = datetime(
+                      candidate.year,
+                      candidate.month,
+                      candidate.day,
+                      hour,
+                      minute,
+                      tzinfo=tz
+                  )
+                  return reading_dt
+
+          # If we didn't find any match (unlikely if data is only 1-5 days old), fallback
+          return pd.NaT
+
+      #convert page to string
+      page_str = str(page)
+
+      page_soup = BeautifulSoup(page_str, "html.parser")
+
+      # Find the table (assuming there's only one table in the HTML)
+      table = page_soup.find("table")
+
+      all_rows = []  # will hold lists of cell values
+
+      for tr in table.find_all("tr"):
+          # Gather all cells (td/th) in this row
+          cells = tr.find_all(["td", "th"])
+          
+          # Skip row if any cell has a colspan
+          skip_row = any(cell.has_attr("colspan") for cell in cells)
+          if skip_row:
+              continue
+
+          # Extract the text from each cell in the row
+          row_data = [cell.get_text(strip=True) for cell in cells]
+          
+          # Only keep rows that have exactly 7 cells
+          if len(row_data) == 7:
+              all_rows.append(row_data)
+
+          # -------------------------------------------------------------------------
+          # 1) Look for the link that contains the word "plot" (case-insensitive)
+          # -------------------------------------------------------------------------
+          plot_link_tag = tr.find("a", string=lambda text: text and "plot" in text.lower())
+          
+          # If found, parse the link's href to extract your IDQ number and second number
+          if plot_link_tag and plot_link_tag.has_attr("href"):
+              href = plot_link_tag["href"]  # e.g. http://www.bom.gov.au/fwo/IDQ65388/IDQ65388.540612.plt.shtml
+              
+              # Get the filename after the last slash
+              filename = href.split("/")[-1]
+              
+              # Use a regular expression to capture the part before the first '.' and the next part
+              match = re.match(r'^(.*?)\.(.*?)\.plt\.shtml$', filename)
+              if match:
+                  idq_number = match.group(1)     # e.g. "IDQ65388"
+                  second_number = match.group(2)  # e.g. "540612"
+              else:
+                  idq_number = None
+                  second_number = None
+          else:
+              # If there is no link or no href attribute
+              idq_number = 99999
+              second_number = 99999
+          
+          # -------------------------------------------------------------------------
+          # 2) Append these two new values into row_data
+          # -------------------------------------------------------------------------
+          row_data.append(idq_number)
+          row_data.append(second_number)
+
+      # Now `all_rows` has 7 + 2 = 9 columns total
+      header = all_rows[0]
+      header[7] = "IDQ_Number"
+      header[8] = "Station_ID"
+
+      import pandas as pd
+      df = pd.DataFrame(all_rows[1:], columns=all_rows[0])
+
+      # remove any instances of "^" from the height column
+      df['Height'] = df['Height'].str.replace('^', '')
+
+      # convert height column to float
+      df['Height'] = df['Height'].astype(float)
+
+      df["ReadingDateTime"] = df["Time/Day"].apply(parse_time_day_to_datetime)
+      df["ReadingDateTime"] = pd.to_datetime(df["ReadingDateTime"])
+
+      # Drop df['Recent Data'] column in place
+      df.drop(columns=['Recent Data'], inplace=True)
+
+      # Fill empty station_id with 99999999
+      df['Station_ID'] = df['Station_ID'].fillna(999999)
+      # Fill empty IDQ_Number with 99999999
+      df['IDQ_Number'] = df['IDQ_Number'].fillna('IDQ99999')
+
+      # Prepare columns for postgres
+      df.columns = (df.columns
+                .str.lower()
+                .str.replace(' ', '_')
+                .str.replace('/', '_'))
+
+      logger.debug(df.loc[df['station_name'] == 'Tallebudgera Ck at Schuster Pk #'])
+      logger.debug(df[['station_id','idq_number']].isna().sum())  # Should be 0,0)
+
+      # --------------------------------------------------------------------
+      #  SQL Steps (multi-step to avoid triple-quote escaping issues)
+      # --------------------------------------------------------------------
+      engine = create_engine("postgresql://docker_user:docker_user@localhost:5432/docker_user")
+
+
+      # 1) Create TEMP table if needed
+      create_temp_sql = """
+      CREATE TABLE IF NOT EXISTS floodlevels_temp (
+          station_name      TEXT,
+          time_day          TEXT,
+          height            NUMERIC,
+          tendency          TEXT,
+          crossing          TEXT,
+          flood_class       TEXT,
+          idq_number        TEXT,
+          station_id        TEXT,
+          readingdatetime   TIMESTAMP WITH TIME ZONE
+      );
+      """
+      with engine.begin() as conn:
+          conn.exec_driver_sql(create_temp_sql)
+
+      # 2) Insert data into temp table
+      df.to_sql("floodlevels_temp", engine, if_exists="append", index=False)
+
+      # 3) Create production table if needed
+      create_prod_sql = """
+      CREATE TABLE IF NOT EXISTS floodlevels (
+          station_name      TEXT,
+          time_day          TEXT,
+          height            NUMERIC,
+          tendency          TEXT,
+          crossing          TEXT,
+          flood_class       TEXT,
+          idq_number        TEXT NOT NULL,
+          station_id        TEXT NOT NULL,
+          readingdatetime   TIMESTAMP WITH TIME ZONE NOT NULL,
+          PRIMARY KEY (IDQ_Number, Station_ID, ReadingDateTime)
+      );
+      """
+      with engine.begin() as conn:
+          conn.exec_driver_sql(create_prod_sql)
+
+      # 4) Upsert from temp to production
+      upsert_sql = """
+      INSERT INTO floodlevels (
+          station_name,
+          time_Day,
+          height,
+          tendency,
+          crossing,
+          flood_class,
+          idq_number,
+          station_id,
+          readingdatetime
+      )
+      SELECT
+          station_name,
+          time_day,
+          height,
+          tendency,
+          crossing,
+          flood_class,
+          idq_number,
+          station_id,
+          readingdatetime
+      FROM floodlevels_temp
+      ON CONFLICT (idq_Number, station_id, readingdatetime)
+      DO UPDATE
+          SET station_name = EXCLUDED.station_name,
+              time_day = EXCLUDED.time_day,
+              height = EXCLUDED.height,
+              tendency = EXCLUDED.tendency,
+              crossing = EXCLUDED.crossing,
+              flood_class = EXCLUDED.flood_class
+      """
+      with engine.begin() as conn:
+          conn.exec_driver_sql(upsert_sql)
+
+      # 5) Drop temp table
+      drop_temp_sql = "DROP TABLE IF EXISTS floodlevels_temp"
+      with engine.begin() as conn:
+          conn.exec_driver_sql(drop_temp_sql)
