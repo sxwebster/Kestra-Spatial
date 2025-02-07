@@ -4,7 +4,7 @@ namespace: workflows
 triggers:
   - id: rain-gauge-qld-schedule
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0/3 * * * *"
+    cron: "0 */3 * * *"
 
 tasks:
   - id: collect-flood-gauge-values-qld
