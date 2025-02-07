@@ -1,0 +1,252 @@
+id: rain-gauge-levels-qld
+namespace: workflows
+
+triggers:
+  - id: rain-gauge-qld-schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0/3 * * * *"
+
+tasks:
+  - id: collect-flood-gauge-values-qld
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    
+    script: |
+        from scrapling import Fetcher
+        import pandas as pd
+        from bs4 import BeautifulSoup
+        from datetime import datetime, timedelta, timezone
+        import re
+        import sqlalchemy
+        from sqlalchemy import create_engine
+        from kestra import Kestra
+
+        logger=Kestra.logger()
+
+        # define a list of URLS
+        urls = [
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60335.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60336.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60337.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60338.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60339.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60340.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60341.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60342.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60343.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60344.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60345.html",
+            "http://www.bom.gov.au/cgi-bin/wrap_fwo.pl?IDQ60346.html"
+        ]
+
+        #For each URL in the list
+        for url in urls:
+            # Try
+            try:
+                page = Fetcher().get(url, stealthy_headers=True, follow_redirects=True)
+
+                #print the type of the page
+                print(type(page))
+
+                #get the text contant of the page in utf-8
+                page = str(page)
+
+                #ensure the string is utf-8
+                page = page.encode('utf-8')
+
+
+
+                # --- Step 1. Read the file and parse it with BeautifulSoup ---
+                soup = BeautifulSoup(page, "html.parser")
+                print("Encoding method :", soup.original_encoding)
+
+                # --- Step 2. Extract the issue time from the second <p> inside <div id="page"> ---
+                # Extract issue_text as before
+                div_page = soup.find("div", id="page")
+                p_tags = div_page.find_all("p")
+                if len(p_tags) < 2:
+                    raise ValueError("Cannot find at least two <p> elements in <div id='page'>")
+                issue_text = p_tags[1].get_text(strip=True)
+                print("Extracted issue_text:", issue_text)
+
+                # Updated regex pattern using \s+ to allow for extra spaces
+                pattern = r"Issued at\s+(\d{1,2}[.:]\d{1,2}\s*[ap]m)\s+on\s+(.+)"
+                match = re.search(pattern, issue_text, re.IGNORECASE)
+                if not match:
+                    raise ValueError("Could not parse issue time text. Check the format and regex pattern.")
+
+                time_str = match.group(1)
+                date_str = match.group(2)
+                print("Time string:", time_str)
+                print("Date string:", date_str)
+
+                # Ensure the time string uses colon rather than dot if needed.
+                time_str = time_str.replace('.', ':')
+
+                # Combine the time and date parts into one datetime string.
+                dt_str = f"{time_str} {date_str}"
+                # For example: "1:15pm Saturday, 1 February 2025"
+                # Parse using strptime. (%I for the 12‐hour clock.)
+                issue_time_naive = datetime.strptime(dt_str, "%I:%M%p %A, %d %B %Y")
+
+                # Define the AEST timezone (UTC+10; note: AEST does not have DST adjustments)
+                aest = timezone(timedelta(hours=10))
+                issue_time_aest = issue_time_naive.replace(tzinfo=aest)
+
+                # --- Step 3. Determine the “last reading” time and compute hourly reading times ---
+                # The header of the first table tells us how many reading columns there are.
+                first_table = soup.find("table", class_="tabledata rhb")
+                thead = first_table.find("thead")
+                header_rows = thead.find_all("tr")
+                if len(header_rows) < 2:
+                    raise ValueError("Expected at least two header rows")
+                # The second header row has one <th> per reading column.
+                time_header_cells = header_rows[1].find_all("th")
+                num_reading_cols = len(time_header_cells)
+
+                # The problem states that the last reading corresponds to the issue time rounded down to the hour.
+                last_reading_aest = issue_time_aest.replace(minute=0, second=0, microsecond=0)
+                # Compute the list of reading times in AEST by working backwards.
+                times_aest = [
+                    last_reading_aest - timedelta(hours=(num_reading_cols - 1 - i))
+                    for i in range(num_reading_cols)
+                ]
+                # Convert these reading times to UTC.
+                times_utc = [t.astimezone(timezone.utc) for t in times_aest]
+
+                # --- Step 4. Process each table and “unpivot” the readings ---
+                all_rows = []  # will store dictionaries for each reading row
+                tables = soup.find_all("table", class_="tabledata rhb")
+                for table in tables:
+                    # (a) Get the table's header times (assumed identical in all tables)
+                    # (b) Extract the river system from the first row of the tbody.
+                    tbody = table.find("tbody")
+                    tbody_rows = tbody.find_all("tr")
+                    if len(tbody_rows) < 2:
+                        continue  # skip if no data rows are available
+                    river_row = tbody_rows[0]
+                    # The river system name is inside the header cell; clean its text.
+                    river = river_row.get_text(separator=" ", strip=True)
+                    
+                    # (c) Process each data row (skipping the first row which holds the river system)
+                    for row in tbody_rows[1:]:
+                        # Each row should contain a station name (first cell) and then the readings.
+                        # Some cells may include a colspan attribute. We'll handle that by repeating the value.
+                        cells = row.find_all(["th", "td"])
+                        if len(cells) < 2:
+                            continue  # skip rows without sufficient data
+                        
+                        station = cells[0].get_text(separator=" ", strip=True)
+                        reading_cells = cells[1:]
+                        readings = []
+                        for cell in reading_cells:
+                            # Check if the cell spans more than one column.
+                            colspan = cell.get("colspan")
+                            try:
+                                span = int(colspan) if colspan else 1
+                            except ValueError:
+                                span = 1
+                            cell_text = cell.get_text(strip=True)
+                            # Treat empty or non-breaking space values as None.
+                            if not cell_text or cell_text == " ":
+                                value = None
+                            else:
+                                try:
+                                    value = float(cell_text)
+                                except ValueError:
+                                    value = None
+                            # Append the reading value for the number of columns spanned.
+                            for _ in range(span):
+                                readings.append(value)
+                                
+                        # Check that the number of readings matches the number of header time columns.
+                        if len(readings) != num_reading_cols:
+                            print(f"Warning: Row for station {station} has {len(readings)} values, expected {num_reading_cols}.")
+                        
+                        # Create one row per reading, storing both AEST and UTC timestamps.
+                        for ts_aest, ts_utc, val in zip(times_aest, times_utc, readings):
+                            all_rows.append({
+                                "station": station,
+                                "river": river,
+                                "timestamp_aest": ts_aest,
+                                "timestamp_utc": ts_utc,
+                                "value": val
+                            })
+
+                # Combine all the data rows into a pandas DataFrame.
+                df = pd.DataFrame(all_rows)
+
+                # --- Optional: sort and display the dataframe ---
+                df.sort_values(["river", "station", "timestamp_aest"], inplace=True)
+                print(df)
+
+                # print column names
+                print(df.columns)
+
+                # -------------------------------------------------------------------------
+                # 1. Create the SQLAlchemy engine.
+                # -------------------------------------------------------------------------
+                engine = create_engine("postgresql://docker_user:docker_user@localhost:5432/docker_user")
+
+                # -------------------------------------------------------------------------
+                # 2. Ensure the production table exists. Then create a temporary table.
+                #    We define a primary key on (station, river, timestamp_utc) so that
+                #    ON CONFLICT can do the upsert. Adjust as you see fit.
+                # -------------------------------------------------------------------------
+                with engine.begin() as conn:
+                    conn.exec_driver_sql("""
+                        CREATE TABLE IF NOT EXISTS rain_data (
+                            station TEXT,
+                            river TEXT,
+                            timestamp_aest TIMESTAMPTZ,
+                            timestamp_utc TIMESTAMPTZ,
+                            value DOUBLE PRECISION,
+                            CONSTRAINT rain_data_pk PRIMARY KEY (station, river, timestamp_utc)
+                        );
+                    """)
+
+                    conn.exec_driver_sql("""
+                        CREATE TEMP TABLE temp_rain_data (
+                            station TEXT,
+                            river TEXT,
+                            timestamp_aest TIMESTAMPTZ,
+                            timestamp_utc TIMESTAMPTZ,
+                            value DOUBLE PRECISION
+                        ) ON COMMIT DROP;
+                    """)
+
+                # -------------------------------------------------------------------------
+                # 3. Insert your DataFrame into the temp table.
+                # -------------------------------------------------------------------------
+                df.to_sql(
+                    name='temp_rain_data',
+                    con=engine,
+                    if_exists='append',  # We already created the table above
+                    index=False
+                )
+
+                # -------------------------------------------------------------------------
+                # 4. Perform the UPSERT from temp_rain_data into rain_data.
+                #    This is done in a transaction block so it either succeeds entirely
+                #    or fails entirely.
+                # -------------------------------------------------------------------------
+                with engine.begin() as conn:
+                    conn.exec_driver_sql("""
+                        INSERT INTO rain_data (station, river, timestamp_aest, timestamp_utc, value)
+                        SELECT station, river, timestamp_aest, timestamp_utc, value
+                        FROM temp_rain_data
+                        ON CONFLICT (station, river, timestamp_utc)
+                        DO UPDATE
+                            SET value = EXCLUDED.value,
+                                timestamp_aest = EXCLUDED.timestamp_aest
+                    """)
+
+                # 5) Drop temp table
+                drop_temp_sql = "DROP TABLE IF EXISTS temp_rain_data"
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(drop_temp_sql)
+
+            except Exception as e:
+                logger.debug(f"Error processing URL {url}: {e}")
+                continue
