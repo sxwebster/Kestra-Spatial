@@ -7,7 +7,7 @@ triggers:
     cron: "0 */3 * * *"
 
 tasks:
-  - id: collect-flood-gauge-values-qld
+  - id: collect-rain-gauge-values-qld
     type: io.kestra.plugin.scripts.python.Script
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
@@ -189,63 +189,70 @@ tasks:
                 # -------------------------------------------------------------------------
                 engine = create_engine("postgresql://docker_user:docker_user@localhost:5432/docker_user")
 
-                # -------------------------------------------------------------------------
-                # 2. Ensure the production table exists. Then create a temporary table.
-                #    We define a primary key on (station, river, timestamp_utc) so that
-                #    ON CONFLICT can do the upsert. Adjust as you see fit.
-                # -------------------------------------------------------------------------
+                # Create temporary table if it doesnt exist (it shouldn't)
+                create_temp_sql = """
+                CREATE TABLE IF NOT EXISTS temp_rain_data (
+                    station TEXT,
+                    river TEXT,
+                    timestamp_aest TIMESTAMPTZ,
+                    timestamp_utc TIMESTAMPTZ,
+                    value DOUBLE PRECISION
+                );
+                """
                 with engine.begin() as conn:
-                    conn.exec_driver_sql("""
-                        CREATE TABLE IF NOT EXISTS rain_data (
-                            station TEXT,
-                            river TEXT,
-                            timestamp_aest TIMESTAMPTZ,
-                            timestamp_utc TIMESTAMPTZ,
-                            value DOUBLE PRECISION,
-                            CONSTRAINT rain_data_pk PRIMARY KEY (station, river, timestamp_utc)
-                        );
-                    """)
+                    conn.exec_driver_sql(create_temp_sql)
 
-                    conn.exec_driver_sql("""
-                        CREATE TEMP TABLE temp_rain_data (
-                            station TEXT,
-                            river TEXT,
-                            timestamp_aest TIMESTAMPTZ,
-                            timestamp_utc TIMESTAMPTZ,
-                            value DOUBLE PRECISION
-                        ) ON COMMIT DROP;
-                    """)
-
-                # -------------------------------------------------------------------------
-                # 3. Insert your DataFrame into the temp table.
-                # -------------------------------------------------------------------------
+                # Insert df to staging table
                 df.to_sql(
-                    name='temp_rain_data',
-                    con=engine,
-                    if_exists='append',  # We already created the table above
-                    index=False
+                "temp_rain_data",
+                engine,
+                if_exists="append",  # or "replace", if you prefer
+                index=False
                 )
 
-                # -------------------------------------------------------------------------
-                # 4. Perform the UPSERT from temp_rain_data into rain_data.
-                #    This is done in a transaction block so it either succeeds entirely
-                #    or fails entirely.
-                # -------------------------------------------------------------------------
+                # Create production table if it doesnt exist (it should)
+                create_prod_sql = """
+                CREATE TABLE IF NOT EXISTS rain_data (
+                    station TEXT,
+                    river TEXT,
+                    timestamp_aest TIMESTAMPTZ,
+                    timestamp_utc TIMESTAMPTZ,
+                    value DOUBLE PRECISION,
+                    CONSTRAINT rain_data_pk PRIMARY KEY (station, river, timestamp_utc)
+                );
+                """
                 with engine.begin() as conn:
-                    conn.exec_driver_sql("""
-                        INSERT INTO rain_data (station, river, timestamp_aest, timestamp_utc, value)
-                        SELECT station, river, timestamp_aest, timestamp_utc, value
-                        FROM temp_rain_data
-                        ON CONFLICT (station, river, timestamp_utc)
-                        DO UPDATE
-                            SET value = EXCLUDED.value,
-                                timestamp_aest = EXCLUDED.timestamp_aest
-                    """)
+                    conn.exec_driver_sql(create_prod_sql)
 
-                # 5) Drop temp table
+                # Upsert from staging to production
+                upsert_sql = """
+                INSERT INTO rain_data (
+                    station,
+                    river,
+                    timestamp_aest,
+                    timestamp_utc,
+                    value
+                )
+                SELECT
+                    station,
+                    river,
+                    timestamp_aest,
+                    timestamp_utc,
+                    value
+                FROM temp_rain_data
+                ON CONFLICT (station, river, timestamp_utc)
+                DO UPDATE
+                SET value = EXCLUDED.value,
+                    timestamp_aest = EXCLUDED.timestamp_aest
+                """
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(upsert_sql)
+                
+                # Drop the staging table
                 drop_temp_sql = "DROP TABLE IF EXISTS temp_rain_data"
                 with engine.begin() as conn:
                     conn.exec_driver_sql(drop_temp_sql)
+
 
             except Exception as e:
                 logger.debug(f"Error processing URL {url}: {e}")
