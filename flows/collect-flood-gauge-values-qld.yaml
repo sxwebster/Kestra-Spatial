@@ -5,6 +5,7 @@ triggers:
   - id: flood-gauge-qld-schedule
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "0/6 * * * *"
+    recoverMissedSchedules: NONE
 
 tasks:
   - id: collect-flood-gauge-values-qld
@@ -20,6 +21,10 @@ tasks:
       from datetime import datetime, timedelta
       from zoneinfo import ZoneInfo
       from kestra import Kestra
+      import logging
+
+      # Set Scraplings logging level to error to disable default warning errors
+      logging.getLogger("scrapling").setLevel(logging.ERROR)
 
       logger=Kestra.logger()
       

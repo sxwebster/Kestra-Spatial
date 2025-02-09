@@ -7,7 +7,8 @@ variables:
 triggers:
   - id: schedule
     type: io.kestra.plugin.core.trigger.Schedule
-    cron: "30 4 * * *" # Run every day at 4:30 AM
+    cron: "0 */6 * * *" # Run every day at 4:30 AM
+    recoverMissedSchedules: NONE
 
 tasks:
   - id: csv_data_download

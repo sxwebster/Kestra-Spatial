@@ -1,0 +1,139 @@
+id: clean-temp-rain-gauge-levels-qld
+namespace: workflows
+
+tasks:
+  - id: clean-collect-rain-gauge-values-qld
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    
+    script: |
+        from sqlalchemy import create_engine
+        import pandas as pd
+        from kestra import Kestra
+        import sqlalchemy
+        import traceback
+
+        logger = Kestra.logger()
+
+        # Create the SQLAlchemy engine
+        engine = create_engine("postgresql://docker_user:docker_user@localhost:5432/docker_user")
+
+        try:
+            # --------------------------------------------
+            # 1. Load data from backup table into a DataFrame
+            # --------------------------------------------
+            query_backup = """
+                SELECT station, river, timestamp_aest, timestamp_utc, value
+                FROM temp_rain_data_backup
+            """
+            df_backup = pd.read_sql(query_backup, engine)
+            logger.debug("Loaded data from temp_rain_data_backup")
+            logger.debug(f"Number of rows before deduplication: {len(df_backup)}")
+
+            # --------------------------------------------
+            # 2. Deduplicate using pandas groupby logic
+            # --------------------------------------------
+            # Define a function to pick the correct row for each group.
+            def deduplicate(group: pd.DataFrame) -> pd.DataFrame:
+                # Filter out rows with a non-null value.
+                non_null = group[group['value'].notnull()]
+                if not non_null.empty:
+                    # If one or more rows have a non-null value, select the row with the largest value.
+                    idx = non_null['value'].idxmax()
+                    return group.loc[[idx]]
+                else:
+                    # All rows are null for this group: return the first row arbitrarily.
+                    return group.iloc[[0]]
+
+            # Group by station and timestamp_utc, then apply the deduplication function.
+            dedup_df = (
+                df_backup
+                .groupby(['station', 'timestamp_utc'], as_index=False, group_keys=False)
+                .apply(deduplicate)
+            )
+            logger.debug("Deduplication complete")
+            logger.debug(f"Number of rows after deduplication: {len(dedup_df)}")
+
+            # --------------------------------------------
+            # 3. Create a temporary staging table
+            # --------------------------------------------
+            # Using a true PostgreSQL temporary table; it will be dropped on commit.
+            create_temp_sql = """
+                CREATE TEMP TABLE temp_rain_data (
+                    station TEXT,
+                    river TEXT,
+                    timestamp_aest TIMESTAMPTZ,
+                    timestamp_utc TIMESTAMPTZ,
+                    value DOUBLE PRECISION
+                ) ON COMMIT DROP;
+            """
+            with engine.begin() as conn:
+                conn.exec_driver_sql(create_temp_sql)
+            logger.debug("Temporary table temp_rain_data created.")
+
+            # --------------------------------------------
+            # 4. Insert the deduplicated DataFrame into the temporary table
+            # --------------------------------------------
+            dedup_df.to_sql(
+                "temp_rain_data",
+                engine,
+                if_exists="append",
+                index=False
+            )
+            logger.debug("Deduplicated data inserted into temp_rain_data.")
+
+            # --------------------------------------------
+            # 5. Ensure the production table exists
+            # --------------------------------------------
+            create_prod_sql = """
+                CREATE TABLE IF NOT EXISTS rain_data (
+                    station TEXT,
+                    river TEXT,
+                    timestamp_aest TIMESTAMPTZ,
+                    timestamp_utc TIMESTAMPTZ,
+                    value DOUBLE PRECISION,
+                    CONSTRAINT rain_data_pk PRIMARY KEY (station, river, timestamp_utc)
+                );
+            """
+            with engine.begin() as conn:
+                conn.exec_driver_sql(create_prod_sql)
+            logger.debug("Production table rain_data exists.")
+
+            # --------------------------------------------
+            # 6. Upsert from the temporary table into the production table
+            # --------------------------------------------
+            upsert_sql = """
+                INSERT INTO rain_data (
+                    station,
+                    river,
+                    timestamp_aest,
+                    timestamp_utc,
+                    value
+                )
+                SELECT DISTINCT station, river, timestamp_aest, timestamp_utc, value
+                FROM temp_rain_data
+                ON CONFLICT (station, river, timestamp_utc)
+                DO UPDATE
+                  SET value = EXCLUDED.value,
+                      timestamp_aest = EXCLUDED.timestamp_aest;
+            """
+            with engine.begin() as conn:
+                conn.exec_driver_sql(upsert_sql)
+            logger.debug("Upsert complete from temp_rain_data to rain_data.")
+
+        except Exception as e:
+            logger.debug(f"Error during deduplication/upsert: {e}")
+            logger.debug(traceback.format_exc())
+        finally:
+            # --------------------------------------------
+            # 7. Cleanup: drop the temporary table if it still exists.
+            # --------------------------------------------
+            try:
+                with engine.begin() as conn:
+                    conn.exec_driver_sql("DROP TABLE IF EXISTS temp_rain_data")
+                logger.debug("Temporary table temp_rain_data dropped.")
+            except Exception as drop_err:
+                logger.debug(f"Error dropping temp table: {drop_err}")
+
+        
